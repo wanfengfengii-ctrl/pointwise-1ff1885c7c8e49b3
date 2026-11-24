@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from catalog.revisions import get_revision
+from catalog.verified_control import load_prepared
 from intake.validation import require_text, validate_quality_flag
 from lake_db import initialize_schema, write_transaction
 
@@ -51,3 +52,29 @@ def get_request(db, request_id):
     if row is None:
         raise LookupError(f'unknown scan request {request_id!r}')
     return ScanRequest(*row)
+
+
+def request_verified(dispatch, revision_id, request_id, start, stop, quality):
+    """Register a verified request against a prepared frozen batch.
+
+    Only the control database is consulted: the length comes from the prepared
+    header, so the source database can already be shut down.
+    """
+    require_text(request_id, 'request ID')
+    validate_quality_flag(quality)
+    prepared = load_prepared(dispatch, revision_id)
+    if prepared is None:
+        raise LookupError(f'frozen batch {revision_id!r} is not opened for verified sampling')
+    if (type(start) is not int or type(stop) is not int
+            or not 0 <= start < stop <= prepared.length):
+        raise ValueError('request must be a nonempty half-open range within the frozen revision')
+    entry = ScanRequest(request_id, revision_id, start, stop, quality)
+    with write_transaction(dispatch):
+        old = dispatch.execute('SELECT * FROM scan_requests WHERE request_id = ?',
+                               (request_id,)).fetchone()
+        if old is None:
+            dispatch.execute('INSERT INTO scan_requests VALUES (?, ?, ?, ?, ?)',
+                             (request_id, revision_id, start, stop, quality))
+        elif ScanRequest(*old) != entry:
+            raise ValueError('request ID already has different obligations')
+    return entry

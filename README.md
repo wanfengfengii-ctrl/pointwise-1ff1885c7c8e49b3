@@ -8,10 +8,12 @@
 
 ```sh
 python3 -B check_project.py
+python3 -B verify_project.py
 python3 -B -m lake_cli demo
+python3 -B -m lake_cli verified-demo
 ```
 
-演示在临时数据库中装载 `samples/frozen_f.json`，签发后用 `samples/review_f.json` 独立核对。可用 `python3 -B -m lake_cli demo --directory ./demo-run` 在一个新目录保留本次结果。`python3 -B -m lake_cli init ./lake-data` 为业务目录建缺失的表，可反复执行并保留原数据。演示目录和业务目录分别使用 `source.sqlite`、`primary.sqlite`、`standby.sqlite`、`receiving.sqlite`。写入API各自拥有业务事务，在调用者事务之外调用。低层保存函数由业务事务调用。用 `lake_db.open_database` 打开连接并启用外键。
+`verify_project.py` 先跑完整原回归，再跑可验抽查的业务核验，任一失败以非零退出。演示在临时数据库中装载 `samples/frozen_f.json`，签发后用 `samples/review_f.json` 独立核对。可用 `python3 -B -m lake_cli demo --directory ./demo-run` 在一个新目录保留本次结果。`python3 -B -m lake_cli init ./lake-data` 为业务目录建缺失的表，可反复执行并保留原数据。演示目录和业务目录分别使用 `source.sqlite`、`primary.sqlite`、`standby.sqlite`、`control.sqlite`、`receiving.sqlite`。写入API各自拥有业务事务，在调用者事务之外调用。低层保存函数由业务事务调用。用 `lake_db.open_database` 打开连接并启用外键。
 
 ## 资料接纳和副本装载
 
@@ -31,3 +33,12 @@ python3 -B -m lake_cli demo
 8. `audit.checks.audit(inbox, result_id, details, reported_total)` 用固定正文核对所交的 `FrozenRow` 序列，复算净量并保存引用原首执的成功记录。行顺序、原位置、数值、缺测、标志、逐位置出处或合计有误时抛 `AuditMismatch`，其 `differences` 提供字段和适用位置。`audit.ledger.get_audit_record` 可按核账号查回成功记录。
 
 演示批 F 的主布局为 `[0,2)`、`[2,4)`，备用布局为 `[0,1)`、`[1,3)`、`[3,4)`。夜班先收到主组 0，再收到备用组 1。此时仍缺逻辑位置 3。完整成果列出位置 0、2、3 及原出处，合计 `7 + 11 + 7 = 25 L`。回归另覆盖错批、空命中、真实提交回滚、重复初始化及断源后复领。
+
+## 冻结批次可验抽查
+
+资料库关停前后改用独立控制库和已装载副本，隔离库依旧独立收件、签发和领取。接口细节见 `VERIFIED_SAMPLING.md`。
+
+1. `catalog.replicas.prepare(source, dispatch, revision_id, replicas)` 只为已登记、已装载的副本开通一次。控制库写入冻结身份、逻辑长度、逐位置加盐承诺、副本分组和非披露开采材料；凭据返回给资料员并在关库前交隔离侧保存。凭据与合法段都不含未命中位置的读值和出处、窗外原行或质控事实，隔离侧也无法凭候选值反查承诺。
+2. `scan.requests.request_verified` 只用控制库登记窗口；`scan.tasks` 与 `scan.handoff` 仍办主任务和接替。`receiving.requests.register_verified` 以单独交来的凭据绑定隔离请求，重投保留原绑定，普通登记不能改写它。
+3. `scan.segments.scan_verified` 先按登记摘要实读副本组、再核对控制库里的准备分组，然后按窗口出 `VerifiedSegment(segment, proof)`。`receiving.intake.receive_verified` 独立重算承诺，确认本段实际应查位置与每个命中判定后才收；错版、错行、越窗、额外事实、缺证坏证、普通段进入可验请求及失格旧任务均拒收且不留覆盖。已确认段重投（含断源、换任务后）领原回执。
+4. 签发、领取和核账沿用 `publication.signing.sign`、`publication.history.read`、`audit.checks.audit`。运行 `python3 -B -m lake_cli verified-demo [--directory DIR]` 演示：开通后关资料库，主段确认、接替、漏列位置 2 的备用段整段拒收、未变动主段复领、合法备用段补齐后按冻结原序签出位置 0、2 共 18 L，以及只重开隔离库领取原成果和首执；迟到请求 `[1,2)` 在 `可用` 下签出 0 L、在 `待核` 下签出 91 L，两次共用同一凭据。

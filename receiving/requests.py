@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 
+from catalog.verified import parse_credential
 from intake.validation import require_text, validate_quality_flag
 from lake_db import initialize_schema, write_transaction
 from publication.store import find_publication_for_request
+from receiving.verified import bind_credential, get_credential, initialize_verified_receipts, is_verified
 from scan.requests import ScanRequest
 from scan.tasks import ScanAssignment
 
@@ -11,6 +13,7 @@ from scan.tasks import ScanAssignment
 class ReceivingRequest:
     request: ScanRequest
     active_task_id: str
+    verified: bool = False
 
 
 def initialize_receiving_requests(db):
@@ -33,6 +36,7 @@ def initialize_receiving_requests(db):
             seal_key BLOB NOT NULL
         );
     ''')
+    initialize_verified_receipts(db)
 
 
 def _find_request(db, request_id):
@@ -40,7 +44,9 @@ def _find_request(db, request_id):
         SELECT request_id, revision_id, start, stop, quality, active_task_id
         FROM receiving_requests WHERE request_id = ?
     ''', (request_id,)).fetchone()
-    return None if row is None else ReceivingRequest(ScanRequest(*row[:-1]), row[-1])
+    if row is None:
+        return None
+    return ReceivingRequest(ScanRequest(*row[:-1]), row[-1], is_verified(db, request_id))
 
 
 def get_receiving_request(db, request_id):
@@ -86,6 +92,8 @@ def register_request(db, obligation, primary):
         current = _find_request(db, obligation.request_id)
         known = find_assignment(db, primary.task_id)
         if current is not None:
+            if current.verified:
+                raise ValueError('request is already bound to a verified batch credential')
             if current.request != obligation or known != primary:
                 raise ValueError('conflicting request registration')
             return current
@@ -96,6 +104,49 @@ def register_request(db, obligation, primary):
                     obligation.stop, obligation.quality, primary.task_id))
         _insert_assignment(db, primary)
         return ReceivingRequest(obligation, primary.task_id)
+
+
+def register_verified(inbox, obligation, primary, batch_credential):
+    """Register a verified request bound to a separately handed-over credential."""
+    require_text(obligation.request_id, 'request ID')
+    require_text(obligation.revision_id, 'revision ID')
+    validate_quality_flag(obligation.quality)
+    if (type(obligation.start) is not int or type(obligation.stop) is not int
+            or not 0 <= obligation.start < obligation.stop < 2**63):
+        raise ValueError('invalid receiving range')
+    _check_assignment(obligation, primary)
+    if primary.predecessor_id is not None:
+        raise ValueError('first assignment must be a primary')
+    credential = parse_credential(batch_credential)
+    if credential.revision_id != obligation.revision_id:
+        raise ValueError('batch credential belongs to a different frozen revision')
+    if obligation.stop > credential.length:
+        raise ValueError('request extends beyond the frozen batch')
+    if credential.replica(primary.replica_id) is None:
+        raise ValueError('primary assignment replica was not prepared for this batch')
+    with write_transaction(inbox):
+        current = _find_request(inbox, obligation.request_id)
+        known = find_assignment(inbox, primary.task_id)
+        if current is not None:
+            if known != primary:
+                raise ValueError('conflicting primary assignment registration')
+            if not current.verified:
+                raise ValueError('request is already registered for ordinary sampling')
+            if current.request != obligation:
+                raise ValueError('conflicting request registration')
+            if get_credential(inbox, obligation.request_id) != batch_credential:
+                raise ValueError('request is bound to a different batch credential')
+            return current
+        if known is not None:
+            raise ValueError('primary task ID already registered')
+        if find_publication_for_request(inbox, obligation.request_id) is not None:
+            raise ValueError('request has already been signed')
+        inbox.execute('INSERT INTO receiving_requests VALUES (?, ?, ?, ?, ?, ?)',
+                      (obligation.request_id, obligation.revision_id, obligation.start,
+                       obligation.stop, obligation.quality, primary.task_id))
+        _insert_assignment(inbox, primary)
+        bind_credential(inbox, obligation.request_id, batch_credential)
+        return ReceivingRequest(obligation, primary.task_id, True)
 
 
 def register_assignment(db, assignment):
@@ -117,4 +168,4 @@ def register_assignment(db, assignment):
         _insert_assignment(db, assignment)
         db.execute('UPDATE receiving_requests SET active_task_id = ? WHERE request_id = ?',
                    (assignment.task_id, assignment.request_id))
-        return ReceivingRequest(current.request, assignment.task_id)
+        return ReceivingRequest(current.request, assignment.task_id, current.verified)

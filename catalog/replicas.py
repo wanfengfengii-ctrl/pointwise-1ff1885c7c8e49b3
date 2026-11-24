@@ -1,9 +1,14 @@
 import hashlib
 import json
+import secrets
 from dataclasses import dataclass
 
 from catalog.layouts import LayoutGroup, validate_layout
 from catalog.revisions import decode_frozen_row, encode_frozen_row, get_revision
+from catalog.verified import (SALT_LENGTH, BatchCredential, CredentialGroup, CredentialReplica,
+                              commit_row, encode_credential)
+from catalog.verified_control import (PreparedBatch, initialize_control, load_prepared,
+                                      store_prepared, store_replica_material)
 from intake.validation import require_text
 from lake_db import canonical_json, initialize_schema, write_transaction
 
@@ -112,3 +117,89 @@ def read_replica_group(replica_db, replica, number):
     if record is None or _digest(record[0]) != checksum:
         raise ValueError(f'unverified replica data for group {number}')
     return LayoutGroup(number, tuple(map(decode_frozen_row, json.loads(record[0]))))
+
+
+def prepare(source, dispatch, revision_id, replicas):
+    """Open a frozen batch for verified sampling using an independent control store.
+
+    Returns the trusted batch credential bytes.  Salts, prepared manifests and
+    the issued credential are written to ``dispatch`` and to each replica so
+    dispatch and scanning no longer need ``source`` after shutdown.
+    """
+    require_text(revision_id, 'revision ID')
+    if dispatch is source:
+        raise ValueError('use an independent control database')
+    if not isinstance(replicas, (list, tuple)) or not replicas:
+        raise ValueError('prepare requires at least one prepared replica')
+    revision = get_revision(source, revision_id)
+    if _has_prepared(dispatch):
+        existing = load_prepared(dispatch, revision_id)
+        if existing is not None:
+            raise ValueError('frozen batch is already opened for verified sampling')
+
+    prepared_replicas = []
+    manifests = []
+    groups = {}
+    salts = {}
+    replica_handles = []
+    seen_ids = set()
+    for entry in replicas:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise ValueError('expected (replica_id, replica_db) pairs')
+        replica_id, replica_db = entry
+        require_text(replica_id, 'replica ID')
+        if replica_id in seen_ids:
+            raise ValueError('replica ID listed twice')
+        seen_ids.add(replica_id)
+        if replica_db is source or replica_db is dispatch:
+            raise ValueError('prepared replicas must be independent stores')
+        replica = get_replica(source, revision_id, replica_id)
+        if any(replica_db is handle[1] for handle in replica_handles):
+            raise ValueError('the same replica store is listed twice')
+        members = {}
+        for number in replica.group_numbers:
+            group = read_replica_group(replica_db, replica, number)
+            positions = tuple(row.position for row in group.rows)
+            groups[(replica_id, number)] = positions
+            for position, row in zip(positions, group.rows):
+                if row != revision.rows[position]:
+                    raise ValueError(f'replica {replica_id!r} differs at frozen position {position}')
+                members.setdefault(position, row)
+        if sorted(members) != list(range(len(revision.rows))):
+            raise ValueError(f'replica {replica_id!r} does not cover the frozen batch')
+        prepared_replicas.append(CredentialReplica(replica_id, tuple(
+            CredentialGroup(number, groups[(replica_id, number)])
+            for number in sorted(replica.group_numbers))))
+        manifests.append((replica_id, replica.manifest))
+        replica_handles.append((replica_id, replica_db, tuple(sorted(replica.group_numbers))))
+        for position, row in members.items():
+            salts.setdefault(position, row)
+
+    if sorted(salts) != list(range(len(revision.rows))):
+        raise ValueError('prepared replicas do not cover the frozen batch')
+
+    salt_rows = {}
+    credentials = []
+    for position in range(len(revision.rows)):
+        row = salts[position]
+        row_salts = {name: secrets.token_bytes(SALT_LENGTH)
+                     for name in ('value', 'origin', 'quality', 'original')}
+        salt_rows[position] = row_salts
+        credentials.append(commit_row(revision_id, position, row, row_salts))
+
+    credential = BatchCredential(revision_id, revision.batch_id, len(revision.rows),
+                                 tuple(credentials), tuple(prepared_replicas))
+    data = encode_credential(credential)
+    prepared = PreparedBatch(revision_id, revision.batch_id, len(revision.rows), data)
+
+    initialize_control(dispatch)
+    # Replica-side grouping is idempotent; the control commit is the last step.
+    for replica_id, replica_db, _ in replica_handles:
+        store_replica_material(replica_db, replica_id, revision_id, groups)
+    store_prepared(dispatch, prepared, manifests, salt_rows, groups)
+    return data
+
+
+def _has_prepared(db):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prepared_batches'"
+                      ).fetchone() is not None
